@@ -1,0 +1,257 @@
+GitHub 50KB 이하 분할 업로드 및 복원 관리자 매뉴얼
+=====================================================
+
+1. 목적
+-------
+
+이 문서는 보안 관리자 또는 정책 관리자가 승인된 테스트 환경에서 대용량 파일을
+작은 조각으로 분할하고, GitHub Contents API를 통해 조각별로 업로드한 뒤,
+다운로드 환경에서 원본 파일로 복원하고 무결성을 검증하는 절차를 설명한다.
+
+분할 업로드는 기밀성 보호 수단이 아니다. 공개 GitHub 저장소에 업로드된 조각은
+누구나 다운로드하고 다시 결합할 수 있다. 정책 검증은 합성 데이터와 private
+테스트 저장소에서 먼저 수행하는 것을 권장한다.
+
+
+2. 기본 원리
+------------
+
+일반적인 git push는 여러 개의 작은 파일을 하나의 Git pack 요청으로 묶을 수 있다.
+따라서 파일을 각각 50KB 미만으로 분할하더라도 실제 HTTP 요청은 50KB를 넘을 수 있다.
+
+GitHub Contents API를 사용하면 파일 한 개마다 별도의 HTTP 요청을 보낼 수 있다.
+다만 Contents API의 content 값은 Base64로 인코딩되므로 원본 바이너리보다 약 4/3배
+커진다. JSON 구조에 필요한 크기도 추가되므로, 요청 크기를 50KB 미만으로 유지하려면
+원본 조각 크기를 약 30,000바이트로 설정하는 것이 안전하다.
+
+
+3. 사전 준비
+------------
+
+필수 준비사항:
+
+- PowerShell 5.1 이상
+- 승인된 GitHub 저장소
+- 대상 저장소 하나에만 접근할 수 있는 Fine-grained Personal Access Token
+- Contents: Read and write 권한
+- 가능한 한 짧은 토큰 만료기간
+- 테스트용 브랜치 또는 별도 private 테스트 저장소
+
+토큰은 스크립트에 직접 저장하지 않고 환경변수로 전달한다.
+
+    $env:GITHUB_TOKEN = "승인된_FINE_GRAINED_PAT"
+
+
+4. 파일 분할
+------------
+
+아래 예시는 PDF를 30,000바이트 단위로 분할한다.
+
+    $source = "C:\Users\사용자\Downloads\original.pdf"
+    $partsDir = "C:\Temp\pdf-parts"
+    $chunkSize = 30000
+
+    New-Item -ItemType Directory -Path $partsDir -Force | Out-Null
+
+    $inputStream = [System.IO.File]::OpenRead($source)
+
+    try {
+        $buffer = New-Object byte[] $chunkSize
+        $index = 1
+
+        while (($bytesRead = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $partName = "manual.pdf.part{0:D4}" -f $index
+            $partPath = Join-Path $partsDir $partName
+            $outputStream = [System.IO.File]::Create($partPath)
+
+            try {
+                $outputStream.Write($buffer, 0, $bytesRead)
+            }
+            finally {
+                $outputStream.Dispose()
+            }
+
+            $index++
+        }
+    }
+    finally {
+        $inputStream.Dispose()
+    }
+
+    Get-ChildItem -LiteralPath $partsDir |
+        Select-Object Name, Length
+
+
+5. 무결성 매니페스트 생성
+------------------------
+
+원본 파일과 각 조각의 SHA-256을 기록한 manifest.json을 생성한다.
+
+    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
+    $sourceInfo = Get-Item -LiteralPath $source
+
+    $parts = Get-ChildItem -LiteralPath $partsDir -Filter "*.part*" |
+        Sort-Object Name |
+        ForEach-Object {
+            [ordered]@{
+                name   = $_.Name
+                size   = $_.Length
+                sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash
+            }
+        }
+
+    $manifest = [ordered]@{
+        original_name = $sourceInfo.Name
+        total_size    = $sourceInfo.Length
+        chunk_size    = $chunkSize
+        sha256        = $sourceHash
+        parts         = $parts
+    }
+
+    $manifest |
+        ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath (Join-Path $partsDir "manifest.json") -Encoding UTF8
+
+
+6. GitHub Contents API로 조각별 업로드
+-------------------------------------
+
+각 조각을 한 번에 하나씩 업로드한다. 요청 전 UTF-8 기준 JSON 본문 크기를 계산하여
+50,000바이트 이상이면 전송하지 않고 중단한다.
+
+    $owner = "GitHub_소유자"
+    $repo = "저장소명"
+    $branch = "pdf-upload-test"
+    $remoteDir = "pdf-parts/manual"
+    $apiBase = "https://api.github.com/repos/$owner/$repo/contents"
+
+    $headers = @{
+        Authorization          = "Bearer $env:GITHUB_TOKEN"
+        Accept                 = "application/vnd.github+json"
+        "X-GitHub-Api-Version" = "2022-11-28"
+        "User-Agent"           = "Admin-Upload-Test"
+    }
+
+    $uploadFiles = Get-ChildItem -LiteralPath $partsDir -File |
+        Sort-Object Name
+
+    foreach ($file in $uploadFiles) {
+        $encodedName = [System.Uri]::EscapeDataString($file.Name)
+        $uri = "$apiBase/$remoteDir/$encodedName"
+
+        $content = [Convert]::ToBase64String(
+            [System.IO.File]::ReadAllBytes($file.FullName)
+        )
+
+        $bodyObject = @{
+            message = "Upload file part $($file.Name)"
+            content = $content
+            branch  = $branch
+        }
+
+        $body = $bodyObject | ConvertTo-Json -Compress
+        $requestSize = [System.Text.Encoding]::UTF8.GetByteCount($body)
+
+        if ($requestSize -ge 50000) {
+            throw "$($file.Name)의 API 요청이 50KB를 초과합니다: $requestSize bytes"
+        }
+
+        Invoke-RestMethod `
+            -Method Put `
+            -Uri $uri `
+            -Headers $headers `
+            -ContentType "application/json; charset=utf-8" `
+            -Body $body
+
+        Write-Host "$($file.Name) uploaded, request size=$requestSize"
+    }
+
+    $env:GITHUB_TOKEN = $null
+
+GitHub Contents API는 파일을 하나 올릴 때마다 커밋을 하나 생성한다. 운영 저장소의
+main 브랜치에 직접 수행하지 말고 임시 브랜치에서 검증한 뒤 PR로 병합하는 것을
+권장한다.
+
+
+7. 파일 복원
+------------
+
+다운로드한 조각을 파일명 순으로 결합한다.
+
+    $partsDir = "C:\Temp\downloaded-parts"
+    $restored = "C:\Temp\restored-manual.pdf"
+
+    $outputStream = [System.IO.File]::Create($restored)
+
+    try {
+        $parts = Get-ChildItem -LiteralPath $partsDir -Filter "*.part*" |
+            Sort-Object Name
+
+        foreach ($part in $parts) {
+            $inputStream = [System.IO.File]::OpenRead($part.FullName)
+
+            try {
+                $inputStream.CopyTo($outputStream)
+            }
+            finally {
+                $inputStream.Dispose()
+            }
+        }
+    }
+    finally {
+        $outputStream.Dispose()
+    }
+
+
+8. SHA-256 검증
+---------------
+
+복원 파일의 SHA-256이 manifest.json의 원본 SHA-256과 일치하는지 확인한다.
+
+    $manifest = Get-Content `
+        -LiteralPath (Join-Path $partsDir "manifest.json") `
+        -Raw |
+        ConvertFrom-Json
+
+    $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $restored).Hash
+
+    [pscustomobject]@{
+        Expected = $manifest.sha256
+        Actual   = $actualHash
+        Match    = ($manifest.sha256 -eq $actualHash)
+    }
+
+Match가 True인 경우에만 복원 파일을 사용한다.
+
+
+9. 보안 및 운영 주의사항
+-----------------------
+
+- 공개 저장소의 모든 조각은 누구나 다시 결합할 수 있다.
+- 분할은 암호화나 접근통제가 아니다.
+- 보안 장비가 파일 내용을 검사하기 어렵게 만들 수 있으므로 반드시 정책 승인 하에
+  테스트한다.
+- GitHub 토큰은 저장소 하나와 Contents 권한으로 제한한다.
+- 토큰을 코드, 로그, 채팅, Git 저장소에 저장하지 않는다.
+- 업로드 완료 후 토큰을 폐기하거나 회전한다.
+- 테스트는 합성 파일과 private 저장소에서 먼저 수행한다.
+- main 직접 업로드보다는 임시 브랜치와 PR을 사용한다.
+- 각 요청의 실제 바이트 크기와 프록시 로그를 함께 보관한다.
+- Git LFS는 원본 객체를 별도로 업로드하므로 50KB 제한을 해결하지 못할 수 있다.
+- git push는 여러 파일을 pack 요청으로 묶으므로 조각별 HTTP 요청을 보장하지 않는다.
+
+
+10. 관리자 검증 체크리스트
+-------------------------
+
+[ ] 테스트 저장소와 브랜치가 승인되었는가
+[ ] 테스트 데이터에 실제 기밀정보가 없는가
+[ ] 토큰이 Fine-grained이며 저장소 하나로 제한되었는가
+[ ] 각 API 요청이 실제로 50,000바이트 미만인가
+[ ] 각 조각의 SHA-256이 기록되었는가
+[ ] 복원 후 원본 SHA-256과 일치하는가
+[ ] 공개 저장소 노출 가능성을 확인했는가
+[ ] 프록시 및 GitHub 감사로그가 남았는가
+[ ] 테스트 종료 후 토큰을 폐기했는가
+[ ] 임시 브랜치와 불필요한 조각을 정리했는가
+
